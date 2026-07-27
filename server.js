@@ -2,18 +2,20 @@
  * سيرفر رفع ملفات بسيط -> Google Drive
  * ------------------------------------
  * - بياخد ملف من الأدمن (multipart/form-data, حقل اسمه "file")
- * - بيرفعه هو بنفسه على Drive باستخدام Service Account (من غير ما الأدمن
- *   يعمل تسجيل دخول Google تاني ومن غير ما يدّي صلاحية Drive لحسابه الشخصي)
+ * - بيرفعه على Drive الشخصي باستخدام OAuth2 (Client ID + Client Secret + Refresh Token)
+ *   بمعنى إن الرفع بيتم "بالنيابة عن" حسابك الشخصي، فبيستخدم مساحة التخزين بتاعتك انت
  * - بيرجع رابط الملف على Drive
  *
- * محتاج تعمل له deploy على استضافة مجانية زي Render.com (Web Service).
+ * محتاج تعمل له deploy على استضافة زي Render.com (Web Service) أو Bonto.
  */
 
 const express = require('express');
 const multer = require('multer');
 const { google } = require('googleapis');
 const cors = require('cors');
-const stream = require('stream');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
 
@@ -23,8 +25,14 @@ app.use(cors());
 // حد أقصى لحجم الملف (عدّله لو عايز، بالـ MB)
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_FILE_SIZE_MB || 100);
 
+// بيتكتب الملف على القرص مؤقتًا بدل ما يتحمّل كامل في الذاكرة (RAM)
+// ده مهم جدًا في كونتينرات مساحة الذاكرة فيها محدودة (زي Bonto) عشان
+// ملفات الـ 20-50 ميجا متعملش crash للسيرفر (Out Of Memory)
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, os.tmpdir()),
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname)}`),
+  }),
   limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024 },
 });
 
@@ -37,21 +45,21 @@ const DEFAULT_DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 const UPLOAD_SECRET = process.env.UPLOAD_SECRET || '';
 
 function getDriveClient() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) {
-    throw new Error('MISSING_SERVICE_ACCOUNT_ENV');
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error('MISSING_OAUTH_ENV');
   }
-  let credentials;
-  try {
-    credentials = JSON.parse(raw);
-  } catch (e) {
-    throw new Error('INVALID_SERVICE_ACCOUNT_JSON');
-  }
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/drive'],
-  });
-  return google.drive({ version: 'v3', auth });
+
+  const auth = new google.auth.OAuth2(clientId, clientSecret);
+  auth.setCredentials({ refresh_token: refreshToken });
+
+  // بدون timeout، أي تعطل في الاتصال بجوجل بيخلي الطلب يفضل معلق للأبد
+  // من غير أي خطأ ظاهر. الـ timeout ده بيضمن إن السيرفر يطلع خطأ واضح
+  // بعد 6 دقايق كحد أقصى بدل ما يقف من غير رد.
+  return google.drive({ version: 'v3', auth, timeout: 360000 });
 }
 
 app.get('/', (req, res) => {
@@ -60,6 +68,96 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true });
+});
+
+app.post('/upload/init', express.json(), async (req, res) => {
+  try {
+    if (UPLOAD_SECRET) {
+      const sentSecret = req.headers['x-upload-secret'];
+      if (sentSecret !== UPLOAD_SECRET) {
+        return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+      }
+    }
+
+    const { fileName, mimeType, folderId } = req.body || {};
+    if (!fileName) {
+      return res.status(400).json({ ok: false, error: 'NO_FILENAME' });
+    }
+
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+    if (!clientId || !clientSecret || !refreshToken) {
+      throw new Error('MISSING_OAUTH_ENV');
+    }
+
+    const auth = new google.auth.OAuth2(clientId, clientSecret);
+    auth.setCredentials({ refresh_token: refreshToken });
+    const { token: accessToken } = await auth.getAccessToken();
+
+    const metadata = { name: fileName };
+    const finalFolderId = folderId || DEFAULT_DRIVE_FOLDER_ID;
+    if (finalFolderId) metadata.parents = [finalFolderId];
+
+    // بنطلب من جوجل "جلسة رفع" (resumable session) — الملف نفسه هيتبعت
+    // من المتصفح مباشرة على اللينك ده، مش عن طريق سيرفرنا خالص
+    const initResp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': mimeType || 'application/octet-stream',
+      },
+      body: JSON.stringify(metadata),
+    });
+
+    if (!initResp.ok) {
+      const text = await initResp.text();
+      console.error('[upload/init] فشل إنشاء الجلسة:', initResp.status, text);
+      throw new Error('DRIVE_INIT_FAILED');
+    }
+
+    const uploadUrl = initResp.headers.get('location');
+    return res.json({ ok: true, uploadUrl });
+  } catch (err) {
+    console.error('[upload/init] error:', err && err.message);
+    if (err.message === 'MISSING_OAUTH_ENV') {
+      return res.status(500).json({ ok: false, error: 'SERVER_MISCONFIGURED' });
+    }
+    return res.status(500).json({ ok: false, error: 'UPLOAD_INIT_FAILED', message: err.message });
+  }
+});
+
+app.post('/upload/finish', express.json(), async (req, res) => {
+  try {
+    if (UPLOAD_SECRET) {
+      const sentSecret = req.headers['x-upload-secret'];
+      if (sentSecret !== UPLOAD_SECRET) {
+        return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+      }
+    }
+
+    const { fileId } = req.body || {};
+    if (!fileId) {
+      return res.status(400).json({ ok: false, error: 'NO_FILE_ID' });
+    }
+
+    const drive = getDriveClient();
+
+    // خلي أي حد معاه اللينك يقدر يشوف/يحمّل الملف
+    await drive.permissions.create({
+      fileId,
+      requestBody: { role: 'reader', type: 'anyone' },
+    });
+
+    const directDownloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    const viewUrl = `https://drive.google.com/file/d/${fileId}/view`;
+
+    return res.json({ ok: true, fileId, url: viewUrl, directUrl: directDownloadUrl });
+  } catch (err) {
+    console.error('[upload/finish] error:', err && err.message);
+    return res.status(500).json({ ok: false, error: 'UPLOAD_FINISH_FAILED', message: err.message });
+  }
 });
 
 app.post('/upload', upload.single('file'), async (req, res) => {
@@ -80,9 +178,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
     const drive = getDriveClient();
 
-    const bufferStream = new stream.PassThrough();
-    bufferStream.end(req.file.buffer);
-
     const fileMetadata = {
       name: req.file.originalname,
     };
@@ -90,15 +185,25 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
     const media = {
       mimeType: req.file.mimetype || 'application/octet-stream',
-      body: bufferStream,
+      body: fs.createReadStream(req.file.path),
     };
 
-    const created = await drive.files.create({
-      requestBody: fileMetadata,
-      media,
-      fields: 'id, name, webViewLink, webContentLink',
-      supportsAllDrives: true,
-    });
+    console.log(`[upload] بدأ رفع "${req.file.originalname}" (${(req.file.size / 1024 / 1024).toFixed(1)} MB) إلى Drive...`);
+    const uploadStartedAt = Date.now();
+
+    let created;
+    try {
+      created = await drive.files.create({
+        requestBody: fileMetadata,
+        media,
+        fields: 'id, name, webViewLink, webContentLink',
+      });
+    } finally {
+      // امسح الملف المؤقت من القرص سواء نجح الرفع أو فشل
+      fs.unlink(req.file.path, () => { });
+    }
+
+    console.log(`[upload] خلص الرفع لـ Drive بعد ${((Date.now() - uploadStartedAt) / 1000).toFixed(1)} ثانية`);
 
     const fileId = created.data.id;
 
@@ -106,8 +211,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     await drive.permissions.create({
       fileId,
       requestBody: { role: 'reader', type: 'anyone' },
-      supportsAllDrives: true,
     });
+    console.log(`[upload] تم ضبط الصلاحيات، الملف جاهز: ${fileId}`);
 
     const directDownloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
     const viewUrl = created.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`;
@@ -121,7 +226,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     });
   } catch (err) {
     console.error('Upload error:', err && err.message, err);
-    if (err.message === 'MISSING_SERVICE_ACCOUNT_ENV' || err.message === 'INVALID_SERVICE_ACCOUNT_JSON') {
+    if (err.message === 'MISSING_OAUTH_ENV') {
       return res.status(500).json({ ok: false, error: 'SERVER_MISCONFIGURED' });
     }
     if (err.code === 'LIMIT_FILE_SIZE') {
